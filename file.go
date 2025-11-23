@@ -65,7 +65,11 @@ func newCompressedFile(cfs *FS, base File, originalName, compressedName string, 
 
 	// Setup for reading (not on create operations)
 	if isReadOnly && !isCreate {
-		if algo != "" && cf.shouldCompress {
+		// Check if file is empty first
+		info, err := cf.base.Stat()
+		isEmpty := err == nil && info.Size() == 0
+
+		if !isEmpty && algo != "" && cf.shouldCompress {
 			// We know the algorithm, create decompressor directly
 			decompressor, err := createDecompressor(algo, cf.base, cfs.config.Level)
 			if err != nil {
@@ -75,13 +79,14 @@ func newCompressedFile(cfs *FS, base File, originalName, compressedName string, 
 				cf.decompressor = decompressor
 				cf.readAlgo = algo
 			}
-		} else if cfs.config.AutoDetect {
+		} else if !isEmpty && cfs.config.AutoDetect {
 			// Try to detect algorithm
 			if err := cf.detectAndSetupDecompressor(); err != nil {
 				// If detection fails, try to read uncompressed
 				cf.shouldCompress = false
 			}
 		}
+		// If file is empty, don't set up decompressor - just read as empty
 	}
 
 	return cf, nil
@@ -197,9 +202,11 @@ func (cf *compressedFile) Close() error {
 	var err error
 
 	// Flush compression on write
-	if cf.shouldCompress && cf.writeBuffer != nil && cf.writeBuffer.Len() > 0 {
-		// Check minimum size
-		if cf.writeBuffer.Len() >= int(cf.cfs.config.MinSize) {
+	if cf.shouldCompress && cf.writeBuffer != nil {
+		bufLen := cf.writeBuffer.Len()
+
+		// Check minimum size and that buffer is not empty
+		if bufLen > 0 && bufLen >= int(cf.cfs.config.MinSize) {
 			// Create compressor and compress
 			compressor, cerr := createCompressor(cf.writeAlgo, cf.base, cf.cfs.config.Level)
 			if cerr != nil {
@@ -226,11 +233,12 @@ func (cf *compressedFile) Close() error {
 			cf.cfs.addBytes(&cf.cfs.stats.BytesWritten, cf.bytesWritten)
 			cf.cfs.addBytes(&cf.cfs.stats.BytesCompressed, cf.bytesWritten)
 			cf.cfs.stats.IncrementAlgorithmCount(cf.writeAlgo)
-		} else {
+		} else if bufLen > 0 {
 			// File too small, write uncompressed
 			_, err = io.Copy(cf.base, cf.writeBuffer)
 			cf.cfs.incrementStat(&cf.cfs.stats.FilesSkipped)
 		}
+		// If bufLen == 0, it's an empty file - just close without writing anything
 	}
 
 	// Close decompressor if present
