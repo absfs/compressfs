@@ -7,14 +7,22 @@ A transparent compression/decompression wrapper for the [absfs](https://github.c
 
 ## Features
 
+### Core Features
 ✅ **5 Compression Algorithms**: gzip, zstd, lz4, brotli, snappy
 ✅ **Transparent Operations**: Files are automatically compressed/decompressed
 ✅ **Configurable Levels**: Fine-tune compression speed vs ratio
 ✅ **Smart Detection**: Auto-detect compression formats
 ✅ **Selective Compression**: Skip already-compressed files with regex patterns
 ✅ **Statistics Tracking**: Monitor compression operations
-✅ **Production Ready**: Comprehensive test suite (40+ tests passing)
+✅ **Production Ready**: Comprehensive test suite (50+ tests passing)
 ✅ **High Performance**: LZ4 achieves 642 MB/s on 4KB files
+
+### Advanced Features (Phase 5)
+🚀 **Algorithm Rules**: Route file types to optimal algorithms automatically
+🚀 **Auto-Tuning**: Dynamically adjust compression levels based on file size
+🚀 **Zstd Dictionaries**: Pre-trained dictionaries for improved compression
+🚀 **Smart Presets**: Intelligent configurations (Smart, HighPerformance, Archival)
+🚀 **Parallel Support**: Configuration for concurrent compression of large files
 
 ## Quick Start
 
@@ -166,6 +174,178 @@ decompressed, _ := compressfs.DecompressBytes(compressed, compressfs.AlgorithmZs
 
 // Auto-detect compression
 algo, found := compressfs.DetectCompressionAlgorithm(data)
+```
+
+## Advanced Features
+
+### Smart Configuration (Recommended for Most Use Cases)
+
+The `SmartConfig` automatically selects optimal algorithms based on file types:
+
+```go
+// Smart configuration with intelligent defaults
+fs, _ := compressfs.NewWithSmartConfig(base)
+
+// Files are automatically routed to optimal algorithms:
+// - *.log files → LZ4 (fast)
+// - *.json, *.xml → Zstd level 6 (balanced)
+// - *.tmp files → Snappy (very fast)
+// - Source code → Zstd level 3 (default)
+// - Already compressed → Skipped
+
+fs.Create("app.log")      // Compressed with LZ4
+fs.Create("config.json")  // Compressed with Zstd level 6
+fs.Create("readme.md")    // Compressed with Zstd level 3
+```
+
+### File-Specific Algorithm Rules
+
+Define custom rules to route different file types to optimal algorithms:
+
+```go
+config := &compressfs.Config{
+	Algorithm: compressfs.AlgorithmZstd,
+	Level:     3,
+	AlgorithmRules: []compressfs.AlgorithmRule{
+		// Critical data: maximum compression
+		{
+			Pattern:   `^/important/`,
+			Algorithm: compressfs.AlgorithmBrotli,
+			Level:     11,
+		},
+		// Logs: fast compression
+		{
+			Pattern:   `\.log$`,
+			Algorithm: compressfs.AlgorithmLZ4,
+			Level:     0,
+		},
+		// Cache: very fast
+		{
+			Pattern:   `^/cache/`,
+			Algorithm: compressfs.AlgorithmSnappy,
+		},
+	},
+}
+
+fs, _ := compressfs.New(base, config)
+
+// Each file uses the matching rule's algorithm
+fs.Create("/important/secrets.txt")  // Brotli level 11
+fs.Create("application.log")         // LZ4
+fs.Create("/cache/temp.dat")         // Snappy
+fs.Create("document.txt")            // Default Zstd level 3
+```
+
+### Auto-Tuning Compression Levels
+
+Automatically adjust compression levels based on file size for optimal performance:
+
+```go
+config := &compressfs.Config{
+	Algorithm:             compressfs.AlgorithmZstd,
+	Level:                 6, // High compression for small files
+	EnableAutoTuning:      true,
+	AutoTuneSizeThreshold: 1024 * 1024, // 1MB threshold
+}
+
+fs, _ := compressfs.New(base, config)
+
+// Small files (< 1MB) use level 6 for good compression
+// Large files (> 1MB) automatically use level 1-2 for speed
+// Very large files (> 10MB) use level 1 for maximum speed
+```
+
+### Zstd Dictionary Compression
+
+Use pre-trained dictionaries for improved compression of similar files:
+
+```go
+// Train dictionary from sample files (in practice)
+samples := [][]byte{
+	[]byte("sample data 1..."),
+	[]byte("sample data 2..."),
+}
+dictionary := compressfs.TrainZstdDictionary(samples, 100*1024) // 100KB dict
+
+config := &compressfs.Config{
+	Algorithm:      compressfs.AlgorithmZstd,
+	Level:          3,
+	ZstdDictionary: dictionary,
+}
+
+fs, _ := compressfs.New(base, config)
+
+// Files are compressed with dictionary for better ratios
+// Especially effective for many similar small files
+```
+
+### Preset Configurations
+
+#### High Performance (Maximum Speed)
+
+```go
+// Optimized for throughput and low latency
+fs, _ := compressfs.NewWithHighPerformance(base)
+
+// - Uses LZ4 algorithm (fastest)
+// - Large buffers (256KB)
+// - Parallel compression enabled
+// - Skips very small files
+```
+
+#### Archival (Maximum Compression)
+
+```go
+// Optimized for long-term storage
+fs, _ := compressfs.NewWithArchival(base)
+
+// - Uses Brotli level 11 (best compression)
+// - Different algorithms for different file types
+// - No auto-tuning (always maximum compression)
+```
+
+#### Recommended (Balanced)
+
+```go
+// Balanced compression and speed
+fs, _ := compressfs.NewWithRecommendedConfig(base)
+
+// - Uses Zstd level 3
+// - Skips already-compressed formats
+// - Skips files < 512 bytes
+```
+
+### Combining Advanced Features
+
+```go
+config := &compressfs.Config{
+	Algorithm: compressfs.AlgorithmZstd,
+	Level:     3,
+
+	// Route file types to optimal algorithms
+	AlgorithmRules: []compressfs.AlgorithmRule{
+		{Pattern: `\.log$`, Algorithm: compressfs.AlgorithmLZ4},
+		{Pattern: `\.json$`, Algorithm: compressfs.AlgorithmZstd, Level: 6},
+	},
+
+	// Auto-tune levels based on file size
+	EnableAutoTuning:      true,
+	AutoTuneSizeThreshold: 1024 * 1024,
+
+	// Use dictionary for better compression
+	ZstdDictionary: myDictionary,
+
+	// Skip already compressed files
+	SkipPatterns: []string{
+		`\.(jpg|png|zip|gz)$`,
+	},
+
+	// Parallel compression for large files
+	EnableParallelCompression: true,
+	ParallelThreshold:         10 * 1024 * 1024, // 10MB
+}
+
+fs, _ := compressfs.New(base, config)
 ```
 
 ## Configuration Options

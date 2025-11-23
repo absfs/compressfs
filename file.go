@@ -19,9 +19,10 @@ type compressedFile struct {
 	compressedName string
 
 	// Compression state (write mode)
-	writeBuffer  *bytes.Buffer
-	compressor   io.WriteCloser
-	writeAlgo    Algorithm
+	writeBuffer    *bytes.Buffer
+	compressor     io.WriteCloser
+	writeAlgo      Algorithm
+	writeLevel     int
 	shouldCompress bool
 
 	// Decompression state (read mode)
@@ -57,10 +58,18 @@ func newCompressedFile(cfs *FS, base File, originalName, compressedName string, 
 	// Setup for writing
 	if isWrite && cf.shouldCompress {
 		cf.writeBuffer = new(bytes.Buffer)
+
+		// Select algorithm and level based on rules/auto-tuning
+		// We'll determine the final algorithm and level at close time when we know the file size
 		if algo == "" {
-			algo = cfs.config.Algorithm
+			// For now, use default - we'll re-evaluate at close time
+			algo, level, _ := cfs.selectAlgorithm(originalName, 0)
+			cf.writeAlgo = algo
+			cf.writeLevel = level
+		} else {
+			cf.writeAlgo = algo
+			cf.writeLevel = cfs.config.Level
 		}
-		cf.writeAlgo = algo
 	}
 
 	// Setup for reading (not on create operations)
@@ -71,7 +80,16 @@ func newCompressedFile(cfs *FS, base File, originalName, compressedName string, 
 
 		if !isEmpty && algo != "" && cf.shouldCompress {
 			// We know the algorithm, create decompressor directly
-			decompressor, err := createDecompressor(algo, cf.base, cfs.config.Level)
+			var decompressor io.ReadCloser
+			var err error
+
+			// Use dictionary if available for zstd
+			if algo == AlgorithmZstd && len(cfs.config.ZstdDictionary) > 0 {
+				decompressor, err = createDecompressorWithDict(algo, cf.base, cfs.config.Level, cfs.config.ZstdDictionary)
+			} else {
+				decompressor, err = createDecompressor(algo, cf.base, cfs.config.Level)
+			}
+
 			if err != nil {
 				// Failed to create decompressor, read uncompressed
 				cf.shouldCompress = false
@@ -124,8 +142,14 @@ func (cf *compressedFile) detectAndSetupDecompressor() error {
 		return err
 	}
 
-	// Create decompressor
-	decompressor, err := createDecompressor(algo, cf.base, cf.cfs.config.Level)
+	// Create decompressor with dictionary support
+	var decompressor io.ReadCloser
+	if algo == AlgorithmZstd && len(cf.cfs.config.ZstdDictionary) > 0 {
+		decompressor, err = createDecompressorWithDict(algo, cf.base, cf.cfs.config.Level, cf.cfs.config.ZstdDictionary)
+	} else {
+		decompressor, err = createDecompressor(algo, cf.base, cf.cfs.config.Level)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -203,12 +227,31 @@ func (cf *compressedFile) Close() error {
 
 	// Flush compression on write
 	if cf.shouldCompress && cf.writeBuffer != nil {
-		bufLen := cf.writeBuffer.Len()
+		bufLen := int64(cf.writeBuffer.Len())
 
 		// Check minimum size and that buffer is not empty
-		if bufLen > 0 && bufLen >= int(cf.cfs.config.MinSize) {
-			// Create compressor and compress
-			compressor, cerr := createCompressor(cf.writeAlgo, cf.base, cf.cfs.config.Level)
+		if bufLen > 0 && bufLen >= cf.cfs.config.MinSize {
+			// Re-evaluate algorithm and level based on actual file size (auto-tuning)
+			finalAlgo, finalLevel, _ := cf.cfs.selectAlgorithm(cf.originalName, bufLen)
+
+			// Use the selected algorithm/level, or stick with what was determined earlier
+			// if rules were used (rules take precedence over auto-tuning)
+			if cf.writeLevel != 0 {
+				// Use the level that was set (either from rules or initial selection)
+				finalLevel = cf.writeLevel
+			}
+
+			// Create compressor with dictionary support
+			var compressor io.WriteCloser
+			var cerr error
+
+			// Check if we should use dictionary (only for zstd)
+			if finalAlgo == AlgorithmZstd && len(cf.cfs.config.ZstdDictionary) > 0 {
+				compressor, cerr = createCompressorWithDict(finalAlgo, cf.base, finalLevel, cf.cfs.config.ZstdDictionary)
+			} else {
+				compressor, cerr = createCompressor(finalAlgo, cf.base, finalLevel)
+			}
+
 			if cerr != nil {
 				cf.base.Close()
 				return cerr
@@ -232,7 +275,7 @@ func (cf *compressedFile) Close() error {
 			cf.cfs.incrementStat(&cf.cfs.stats.FilesCompressed)
 			cf.cfs.addBytes(&cf.cfs.stats.BytesWritten, cf.bytesWritten)
 			cf.cfs.addBytes(&cf.cfs.stats.BytesCompressed, cf.bytesWritten)
-			cf.cfs.stats.IncrementAlgorithmCount(cf.writeAlgo)
+			cf.cfs.stats.IncrementAlgorithmCount(finalAlgo)
 		} else if bufLen > 0 {
 			// File too small, write uncompressed
 			_, err = io.Copy(cf.base, cf.writeBuffer)
