@@ -21,6 +21,18 @@ const (
 	AlgorithmAuto   Algorithm = "auto"
 )
 
+// AlgorithmRule defines algorithm selection based on file patterns
+type AlgorithmRule struct {
+	// Pattern to match file names (regex)
+	Pattern string
+
+	// Algorithm to use for matching files
+	Algorithm Algorithm
+
+	// Compression level override (0 = use default)
+	Level int
+}
+
 // Config holds compression filesystem configuration
 type Config struct {
 	// Algorithm to use for compression (default: zstd)
@@ -52,19 +64,63 @@ type Config struct {
 
 	// Minimum file size to compress (skip smaller files)
 	MinSize int64 // default: 0 (compress all)
+
+	// ===== ADVANCED FEATURES (Phase 5) =====
+
+	// AlgorithmRules defines file-specific algorithm selection
+	// Rules are evaluated in order, first match wins
+	AlgorithmRules []AlgorithmRule
+
+	// EnableAutoTuning enables automatic compression level adjustment
+	// based on file size and type
+	EnableAutoTuning bool
+
+	// AutoTuneSizeThreshold is the file size threshold for auto-tuning (bytes)
+	// Files larger than this may use lower compression levels for speed
+	AutoTuneSizeThreshold int64 // default: 1MB
+
+	// ZstdDictionary is a pre-trained dictionary for zstd compression
+	// Improves compression ratio for similar files
+	ZstdDictionary []byte
+
+	// EnableParallelCompression enables parallel compression for large files
+	// Only applies to files larger than ParallelThreshold
+	EnableParallelCompression bool
+
+	// ParallelThreshold is the minimum file size for parallel compression
+	ParallelThreshold int64 // default: 10MB
+
+	// ParallelChunkSize is the chunk size for parallel compression
+	ParallelChunkSize int // default: 1MB
+
+	// AllowRecompression allows transparent re-compression when reading
+	// files compressed with a different algorithm
+	AllowRecompression bool
+
+	// RecompressionTarget is the target algorithm for re-compression
+	RecompressionTarget Algorithm
 }
 
 // DefaultConfig returns a config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		Algorithm:         AlgorithmZstd,
-		Level:             3,
-		SkipPatterns:      nil,
-		AutoDetect:        true,
-		PreserveExtension: true,
-		StripExtension:    true,
-		BufferSize:        64 * 1024, // 64KB
-		MinSize:           0,
+		Algorithm:                 AlgorithmZstd,
+		Level:                     3,
+		SkipPatterns:              nil,
+		AutoDetect:                true,
+		PreserveExtension:         true,
+		StripExtension:            true,
+		BufferSize:                64 * 1024,  // 64KB
+		MinSize:                   0,
+		AlgorithmRules:            nil,
+		EnableAutoTuning:          false,
+		AutoTuneSizeThreshold:     1024 * 1024,      // 1MB
+		ZstdDictionary:            nil,
+		EnableParallelCompression: false,
+		ParallelThreshold:         10 * 1024 * 1024, // 10MB
+		ParallelChunkSize:         1024 * 1024,      // 1MB
+		AllowRecompression:        false,
+		RecompressionTarget:       AlgorithmZstd,
 	}
 }
 
@@ -141,11 +197,19 @@ type File interface {
 	Sync() error
 }
 
+// compiledRule holds a compiled algorithm rule
+type compiledRule struct {
+	pattern   *regexp.Regexp
+	algorithm Algorithm
+	level     int
+}
+
 // FS wraps a FileSystem with compression capabilities
 type FS struct {
 	base   FileSystem
 	config *Config
 	skip   *regexp.Regexp // Compiled skip patterns
+	rules  []compiledRule  // Compiled algorithm rules
 	stats  Stats
 	mu     sync.RWMutex
 }
@@ -171,10 +235,28 @@ func New(base FileSystem, config *Config) (*FS, error) {
 		}
 	}
 
+	// Compile algorithm rules
+	var rules []compiledRule
+	if len(config.AlgorithmRules) > 0 {
+		rules = make([]compiledRule, 0, len(config.AlgorithmRules))
+		for _, rule := range config.AlgorithmRules {
+			re, err := regexp.Compile(rule.Pattern)
+			if err != nil {
+				return nil, err
+			}
+			rules = append(rules, compiledRule{
+				pattern:   re,
+				algorithm: rule.Algorithm,
+				level:     rule.Level,
+			})
+		}
+	}
+
 	return &FS{
 		base:   base,
 		config: config,
 		skip:   skip,
+		rules:  rules,
 		stats:  Stats{},
 	}, nil
 }
@@ -185,6 +267,93 @@ func (cfs *FS) shouldSkip(name string) bool {
 		return false
 	}
 	return cfs.skip.MatchString(name)
+}
+
+// selectAlgorithm selects the compression algorithm and level based on rules
+// Returns (algorithm, level, useDefaults)
+func (cfs *FS) selectAlgorithm(name string, fileSize int64) (Algorithm, int, bool) {
+	cfs.mu.RLock()
+	defer cfs.mu.RUnlock()
+
+	// Check algorithm rules first (highest priority)
+	for _, rule := range cfs.rules {
+		if rule.pattern.MatchString(name) {
+			algo := rule.algorithm
+			level := rule.level
+			if level == 0 {
+				// Use default level for this algorithm
+				level = cfs.getDefaultLevel(algo)
+			}
+			return algo, level, false
+		}
+	}
+
+	// Use default algorithm and level
+	algo := cfs.config.Algorithm
+	level := cfs.config.Level
+
+	// Apply auto-tuning if enabled
+	if cfs.config.EnableAutoTuning && fileSize > 0 {
+		level = cfs.autoTuneLevel(algo, fileSize)
+	}
+
+	return algo, level, true
+}
+
+// getDefaultLevel returns the default compression level for an algorithm
+func (cfs *FS) getDefaultLevel(algo Algorithm) int {
+	switch algo {
+	case AlgorithmGzip:
+		return 6
+	case AlgorithmZstd:
+		return 3
+	case AlgorithmLZ4:
+		return 1
+	case AlgorithmBrotli:
+		return 6
+	case AlgorithmSnappy:
+		return 0 // No levels for snappy
+	default:
+		return cfs.config.Level
+	}
+}
+
+// autoTuneLevel adjusts compression level based on file size
+func (cfs *FS) autoTuneLevel(algo Algorithm, fileSize int64) int {
+	// If file is smaller than threshold, use configured level
+	if fileSize < cfs.config.AutoTuneSizeThreshold {
+		return cfs.config.Level
+	}
+
+	// For larger files, use faster compression
+	switch algo {
+	case AlgorithmGzip:
+		// For large files, use level 3-4 instead of default 6
+		if fileSize > 10*1024*1024 { // > 10MB
+			return 3
+		}
+		return 4
+	case AlgorithmZstd:
+		// For large files, use level 1-2 instead of default 3
+		if fileSize > 10*1024*1024 { // > 10MB
+			return 1
+		}
+		return 2
+	case AlgorithmBrotli:
+		// For large files, use much lower level
+		if fileSize > 10*1024*1024 { // > 10MB
+			return 3
+		}
+		return 4
+	case AlgorithmLZ4:
+		// LZ4 is already fast, keep level 1
+		return 1
+	case AlgorithmSnappy:
+		// No levels for snappy
+		return 0
+	default:
+		return cfs.config.Level
+	}
 }
 
 // GetStats returns current statistics
