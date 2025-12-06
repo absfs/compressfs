@@ -32,3 +32,8 @@ Thumbs.db
 # Test files
 testdata/
 *.tmp
+
+# Claude Code
+.claude/
+CLAUDE.md
+.project_meta/
