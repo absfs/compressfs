@@ -93,32 +93,32 @@ func LowCPUConfig() *Config {
 // ===== CONVENIENCE CONSTRUCTORS FOR ADVANCED CONFIGS =====
 
 // NewWithSmartConfig creates a compressed filesystem with intelligent algorithm selection
-func NewWithSmartConfig(base FileSystem) (*FS, error) {
+func NewWithSmartConfig(base interface{}) (*FS, error) {
 	return New(base, SmartConfig())
 }
 
 // NewWithHighPerformance creates a compressed filesystem optimized for speed
-func NewWithHighPerformance(base FileSystem) (*FS, error) {
+func NewWithHighPerformance(base interface{}) (*FS, error) {
 	return New(base, HighPerformanceConfig())
 }
 
 // NewWithArchival creates a compressed filesystem optimized for maximum compression
-func NewWithArchival(base FileSystem) (*FS, error) {
+func NewWithArchival(base interface{}) (*FS, error) {
 	return New(base, ArchivalConfig())
 }
 
 // NewWithRecommendedConfig creates a new compressed filesystem with recommended settings
-func NewWithRecommendedConfig(base FileSystem) (*FS, error) {
+func NewWithRecommendedConfig(base interface{}) (*FS, error) {
 	return New(base, RecommendedConfig())
 }
 
 // NewWithFastestConfig creates a new compressed filesystem optimized for speed
-func NewWithFastestConfig(base FileSystem) (*FS, error) {
+func NewWithFastestConfig(base interface{}) (*FS, error) {
 	return New(base, FastestConfig())
 }
 
 // NewWithBestCompression creates a new compressed filesystem optimized for compression ratio
-func NewWithBestCompression(base FileSystem) (*FS, error) {
+func NewWithBestCompression(base interface{}) (*FS, error) {
 	return New(base, BestCompressionConfig())
 }
 

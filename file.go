@@ -6,12 +6,14 @@ import (
 	"io/fs"
 	"os"
 	"sync"
+
+	"github.com/absfs/absfs"
 )
 
 // compressedFile wraps a file with compression/decompression
 type compressedFile struct {
 	cfs  *FS
-	base File
+	base absfs.File
 	flag int
 
 	// Original and compressed names
@@ -37,7 +39,7 @@ type compressedFile struct {
 }
 
 // newCompressedFile creates a new compressed file wrapper
-func newCompressedFile(cfs *FS, base File, originalName, compressedName string, flag int, algo Algorithm) (*compressedFile, error) {
+func newCompressedFile(cfs *FS, base absfs.File, originalName, compressedName string, flag int, algo Algorithm) (*compressedFile, error) {
 	cf := &compressedFile{
 		cfs:            cfs,
 		base:           base,
@@ -79,23 +81,67 @@ func newCompressedFile(cfs *FS, base File, originalName, compressedName string, 
 		isEmpty := err == nil && info.Size() == 0
 
 		if !isEmpty && algo != "" && cf.shouldCompress {
-			// We know the algorithm, create decompressor directly
-			var decompressor io.ReadCloser
-			var err error
-
-			// Use dictionary if available for zstd
-			if algo == AlgorithmZstd && len(cfs.config.ZstdDictionary) > 0 {
-				decompressor, err = createDecompressorWithDict(algo, cf.base, cfs.config.Level, cfs.config.ZstdDictionary)
-			} else {
-				decompressor, err = createDecompressor(algo, cf.base, cfs.config.Level)
-			}
-
-			if err != nil {
-				// Failed to create decompressor, read uncompressed
+			// We have a known algorithm from the file extension
+			// Check magic bytes to verify the file is actually compressed
+			magicBuf := make([]byte, 10)
+			n, magicErr := cf.base.Read(magicBuf)
+			if magicErr != nil && magicErr != io.EOF {
+				// Read error, treat as uncompressed
 				cf.shouldCompress = false
 			} else {
-				cf.decompressor = decompressor
-				cf.readAlgo = algo
+				// Check if the data is actually compressed
+				detectedAlgo, isCompressed := IsCompressed(magicBuf[:n])
+
+				// Seek back to start for reading
+				if _, seekErr := cf.base.Seek(0, io.SeekStart); seekErr != nil {
+					// Can't seek, treat as uncompressed
+					cf.shouldCompress = false
+				} else {
+					// Determine which algorithm to use:
+					// 1. If we detected compression via magic bytes, use that
+					// 2. If we didn't detect via magic bytes:
+					//    a. For brotli/snappy, trust the extension (no reliable magic bytes)
+					//    b. For other formats, file might be uncompressed (MinSize skip)
+					useAlgo := algo
+					shouldDecompress := isCompressed
+
+					if isCompressed && detectedAlgo != "" {
+						// Magic bytes matched, use detected algorithm
+						useAlgo = detectedAlgo
+					} else if !isCompressed {
+						// Magic bytes didn't match
+						// For brotli and snappy, trust the extension (no reliable magic bytes)
+						// For gzip, zstd, lz4 - they have magic bytes, so file is truly uncompressed
+						switch algo {
+						case AlgorithmBrotli, AlgorithmSnappy:
+							shouldDecompress = true // Trust extension for these formats
+						default:
+							shouldDecompress = false // Has magic bytes but didn't match
+						}
+					}
+
+					if shouldDecompress {
+						var decompressor io.ReadCloser
+						var err error
+
+						// Use dictionary if available for zstd
+						if useAlgo == AlgorithmZstd && len(cfs.config.ZstdDictionary) > 0 {
+							decompressor, err = createDecompressorWithDict(useAlgo, cf.base, cfs.config.Level, cfs.config.ZstdDictionary)
+						} else {
+							decompressor, err = createDecompressor(useAlgo, cf.base, cfs.config.Level)
+						}
+
+						if err != nil {
+							// Failed to create decompressor, read uncompressed
+							cf.shouldCompress = false
+						} else {
+							cf.decompressor = decompressor
+							cf.readAlgo = useAlgo
+						}
+					} else {
+						cf.shouldCompress = false
+					}
+				}
 			}
 		} else if !isEmpty && cfs.config.AutoDetect {
 			// Try to detect algorithm
@@ -173,6 +219,12 @@ func (cf *compressedFile) Read(p []byte) (n int, err error) {
 		if n > 0 {
 			cf.bytesRead += int64(n)
 			cf.cfs.addBytes(&cf.cfs.stats.BytesRead, int64(n))
+			// If we read data, don't return EOF on the same call
+			// This matches typical file reading behavior where EOF is returned
+			// on the subsequent read after all data has been consumed
+			if err == io.EOF {
+				err = nil
+			}
 		}
 		return n, err
 	}
@@ -280,6 +332,23 @@ func (cf *compressedFile) Close() error {
 			// File too small, write uncompressed
 			_, err = io.Copy(cf.base, cf.writeBuffer)
 			cf.cfs.incrementStat(&cf.cfs.stats.FilesSkipped)
+
+			// If we have a compression extension but didn't compress,
+			// rename the file to remove the extension to avoid confusion on read
+			if cf.compressedName != cf.originalName && HasCompressionExtension(cf.compressedName) {
+				// Close the base file before renaming
+				if cerr := cf.base.Close(); cerr != nil && err == nil {
+					err = cerr
+				}
+
+				// Rename from compressed name to original name
+				if renameErr := cf.cfs.base.Rename(cf.compressedName, cf.originalName); renameErr != nil {
+					// If rename fails, it's not critical - we can still read the file
+					// It just might try to decompress it unnecessarily
+				}
+
+				return err // Already closed the base file
+			}
 		}
 		// If bufLen == 0, it's an empty file - just close without writing anything
 	}
@@ -385,4 +454,127 @@ func (cf *compressedFile) CompressedSize() int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// ============================================================================
+// absfs.File interface methods
+// ============================================================================
+
+// Name returns the name of the file
+func (cf *compressedFile) Name() string {
+	return cf.originalName
+}
+
+// ReadAt reads len(b) bytes from the File starting at byte offset off
+func (cf *compressedFile) ReadAt(b []byte, off int64) (n int, err error) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return 0, fs.ErrClosed
+	}
+
+	// ReadAt not supported for compressed files
+	if cf.decompressor != nil {
+		return 0, ErrSeekNotSupported
+	}
+
+	// Delegate to base file if it supports ReadAt
+	if ra, ok := cf.base.(io.ReaderAt); ok {
+		return ra.ReadAt(b, off)
+	}
+
+	return 0, os.ErrInvalid
+}
+
+// WriteAt writes len(b) bytes to the File starting at byte offset off
+func (cf *compressedFile) WriteAt(b []byte, off int64) (n int, err error) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return 0, fs.ErrClosed
+	}
+
+	// WriteAt not supported for compressed files
+	if cf.compressor != nil || cf.writeBuffer != nil {
+		return 0, ErrSeekNotSupported
+	}
+
+	// Delegate to base file if it supports WriteAt
+	if wa, ok := cf.base.(io.WriterAt); ok {
+		return wa.WriteAt(b, off)
+	}
+
+	return 0, os.ErrInvalid
+}
+
+// WriteString writes a string to the file
+func (cf *compressedFile) WriteString(s string) (n int, err error) {
+	return cf.Write([]byte(s))
+}
+
+// Truncate changes the size of the file
+func (cf *compressedFile) Truncate(size int64) error {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return fs.ErrClosed
+	}
+
+	// Truncate not supported for compressed files
+	if cf.compressor != nil || cf.decompressor != nil {
+		return ErrSeekNotSupported
+	}
+
+	// Delegate to base file if it supports Truncate
+	type truncater interface {
+		Truncate(int64) error
+	}
+	if t, ok := cf.base.(truncater); ok {
+		return t.Truncate(size)
+	}
+
+	return os.ErrInvalid
+}
+
+// Readdir reads the contents of the directory associated with the file
+func (cf *compressedFile) Readdir(n int) ([]os.FileInfo, error) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return nil, fs.ErrClosed
+	}
+
+	// Delegate to base file if it supports Readdir
+	type readdirer interface {
+		Readdir(int) ([]os.FileInfo, error)
+	}
+	if rd, ok := cf.base.(readdirer); ok {
+		return rd.Readdir(n)
+	}
+
+	return nil, os.ErrInvalid
+}
+
+// Readdirnames reads the contents of the directory and returns the names
+func (cf *compressedFile) Readdirnames(n int) (names []string, err error) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return nil, fs.ErrClosed
+	}
+
+	// Delegate to base file if it supports Readdirnames
+	type readdirnamer interface {
+		Readdirnames(int) ([]string, error)
+	}
+	if rdn, ok := cf.base.(readdirnamer); ok {
+		return rdn.Readdirnames(n)
+	}
+
+	return nil, os.ErrInvalid
 }

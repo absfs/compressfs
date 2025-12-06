@@ -4,9 +4,14 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/absfs/absfs"
 )
 
 // Algorithm represents a compression algorithm
@@ -29,7 +34,7 @@ type AlgorithmRule struct {
 	// Algorithm to use for matching files
 	Algorithm Algorithm
 
-	// Compression level override (0 = use default)
+	// Compression level override (-1 = use default, 0+ = specific level)
 	Level int
 }
 
@@ -177,6 +182,7 @@ var (
 )
 
 // FileSystem interface that compressfs wraps
+// Deprecated: Use absfs.FileSystem instead. This interface is maintained for backward compatibility.
 type FileSystem interface {
 	Open(name string) (File, error)
 	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
@@ -206,18 +212,45 @@ type compiledRule struct {
 
 // FS wraps a FileSystem with compression capabilities
 type FS struct {
-	base   FileSystem
+	base   absfs.FileSystem
 	config *Config
 	skip   *regexp.Regexp // Compiled skip patterns
 	rules  []compiledRule  // Compiled algorithm rules
 	stats  Stats
+	cwd    string          // Current working directory
 	mu     sync.RWMutex
 }
 
 // New creates a new compressed filesystem wrapper
-func New(base FileSystem, config *Config) (*FS, error) {
+// The base parameter can be:
+// - absfs.FileSystem
+// - absfs.Filer (will be extended to FileSystem)
+// - FileSystem (deprecated interface, will be adapted)
+func New(base interface{}, config *Config) (*FS, error) {
 	if config == nil {
 		config = DefaultConfig()
+	}
+
+	// Convert the base filesystem to absfs.FileSystem
+	var absBase absfs.FileSystem
+
+	switch b := base.(type) {
+	case absfs.FileSystem:
+		// Already the right type
+		absBase = b
+	case absfs.Filer:
+		// Extend Filer to FileSystem
+		absBase = absfs.ExtendFiler(b)
+	case FileSystem:
+		// Old deprecated interface - adapt it
+		if filer, ok := base.(absfs.Filer); ok {
+			absBase = absfs.ExtendFiler(filer)
+		} else {
+			// Create a filerAdapter to make it compatible
+			absBase = absfs.ExtendFiler(&filerAdapter{base: b})
+		}
+	default:
+		return nil, errors.New("compressfs: base must be absfs.FileSystem, absfs.Filer, or compressfs.FileSystem")
 	}
 
 	// Compile skip patterns
@@ -252,13 +285,65 @@ func New(base FileSystem, config *Config) (*FS, error) {
 		}
 	}
 
+	// Initialize cwd
+	cwd := "/"
+	if wd, err := absBase.Getwd(); err == nil {
+		cwd = wd
+	}
+
 	return &FS{
-		base:   base,
+		base:   absBase,
 		config: config,
 		skip:   skip,
 		rules:  rules,
 		stats:  Stats{},
+		cwd:    cwd,
 	}, nil
+}
+
+// filerAdapter adapts the old FileSystem interface to absfs.Filer
+type filerAdapter struct {
+	base FileSystem
+}
+
+func (a *filerAdapter) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
+	f, err := a.base.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return f.(absfs.File), nil
+}
+
+func (a *filerAdapter) Mkdir(name string, perm os.FileMode) error {
+	return a.base.Mkdir(name, perm)
+}
+
+func (a *filerAdapter) Remove(name string) error {
+	return a.base.Remove(name)
+}
+
+func (a *filerAdapter) Rename(oldpath, newpath string) error {
+	// Not supported in old FileSystem interface
+	return os.ErrPermission
+}
+
+func (a *filerAdapter) Stat(name string) (os.FileInfo, error) {
+	return a.base.Stat(name)
+}
+
+func (a *filerAdapter) Chmod(name string, mode os.FileMode) error {
+	// Not supported in old FileSystem interface
+	return os.ErrPermission
+}
+
+func (a *filerAdapter) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	// Not supported in old FileSystem interface
+	return os.ErrPermission
+}
+
+func (a *filerAdapter) Chown(name string, uid, gid int) error {
+	// Not supported in old FileSystem interface
+	return os.ErrPermission
 }
 
 // shouldSkip returns true if the file should not be compressed
@@ -280,10 +365,11 @@ func (cfs *FS) selectAlgorithm(name string, fileSize int64) (Algorithm, int, boo
 		if rule.pattern.MatchString(name) {
 			algo := rule.algorithm
 			level := rule.level
-			if level == 0 {
-				// Use default level for this algorithm
+			if level < 0 {
+				// Negative level means use default for this algorithm
 				level = cfs.getDefaultLevel(algo)
 			}
+			// Otherwise use the specified level (including 0)
 			return algo, level, false
 		}
 	}
@@ -401,3 +487,241 @@ func (cfs *FS) SetLevel(level int) error {
 	cfs.config.Level = level
 	return nil
 }
+
+// ============================================================================
+// absfs.FileSystem interface implementation
+// ============================================================================
+
+// Rename renames (moves) a file from oldpath to newpath
+func (cfs *FS) Rename(oldpath, newpath string) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Determine actual file names considering compression extensions
+	actualOldpath := oldpath
+	actualNewpath := newpath
+
+	// For oldpath, try to find the actual file with compression extension
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := oldpath + ext
+			if _, err := cfs.base.Stat(testName); err == nil {
+				actualOldpath = testName
+				// If we found a compressed file, the new path should also have the extension
+				if !HasCompressionExtension(newpath) {
+					actualNewpath = newpath + ext
+				}
+				break
+			}
+		}
+	}
+
+	return cfs.base.Rename(actualOldpath, actualNewpath)
+}
+
+// Chmod changes the mode of the named file
+func (cfs *FS) Chmod(name string, mode os.FileMode) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Try exact name first
+	err := cfs.base.Chmod(name, mode)
+	if err == nil {
+		return nil
+	}
+
+	// If StripExtension is enabled, try with compression extensions
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := name + ext
+			if err := cfs.base.Chmod(testName, mode); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return err
+}
+
+// Chtimes changes the access and modification times of the named file
+func (cfs *FS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Try exact name first
+	err := cfs.base.Chtimes(name, atime, mtime)
+	if err == nil {
+		return nil
+	}
+
+	// If StripExtension is enabled, try with compression extensions
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := name + ext
+			if err := cfs.base.Chtimes(testName, atime, mtime); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return err
+}
+
+// Chown changes the owner and group ids of the named file
+func (cfs *FS) Chown(name string, uid, gid int) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Try exact name first
+	err := cfs.base.Chown(name, uid, gid)
+	if err == nil {
+		return nil
+	}
+
+	// If StripExtension is enabled, try with compression extensions
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := name + ext
+			if err := cfs.base.Chown(testName, uid, gid); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return err
+}
+
+// Separator returns the path separator
+func (cfs *FS) Separator() uint8 {
+	return filepath.Separator
+}
+
+// ListSeparator returns the list separator
+func (cfs *FS) ListSeparator() uint8 {
+	return filepath.ListSeparator
+}
+
+// Chdir changes the current working directory
+func (cfs *FS) Chdir(dir string) error {
+	cfs.mu.Lock()
+	defer cfs.mu.Unlock()
+
+	// First check if base supports Chdir
+	if err := cfs.base.Chdir(dir); err != nil {
+		// If base doesn't support it or it fails, just update our internal state
+		// after verifying the directory exists
+		if _, err := cfs.base.Stat(dir); err != nil {
+			return err
+		}
+	}
+
+	// Update internal cwd
+	if !filepath.IsAbs(dir) {
+		cfs.cwd = filepath.Join(cfs.cwd, dir)
+	} else {
+		cfs.cwd = dir
+	}
+
+	return nil
+}
+
+// Getwd returns the current working directory
+func (cfs *FS) Getwd() (string, error) {
+	cfs.mu.RLock()
+	defer cfs.mu.RUnlock()
+
+	// Try to get from base first
+	if wd, err := cfs.base.Getwd(); err == nil {
+		return wd, nil
+	}
+
+	// Fall back to internal cwd
+	return cfs.cwd, nil
+}
+
+// TempDir returns the temporary directory
+func (cfs *FS) TempDir() string {
+	return cfs.base.TempDir()
+}
+
+// MkdirAll creates a directory path, creating parent directories as needed
+func (cfs *FS) MkdirAll(name string, perm os.FileMode) error {
+	return cfs.base.MkdirAll(name, perm)
+}
+
+// RemoveAll removes path and any children it contains
+func (cfs *FS) RemoveAll(path string) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Try exact path first
+	err := cfs.base.RemoveAll(path)
+	if err == nil {
+		return nil
+	}
+
+	// If StripExtension is enabled, try with compression extensions
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := path + ext
+			if err := cfs.base.RemoveAll(testName); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return err
+}
+
+// Truncate changes the size of the named file
+func (cfs *FS) Truncate(name string, size int64) error {
+	cfs.mu.RLock()
+	config := cfs.config
+	cfs.mu.RUnlock()
+
+	// Determine actual filename considering compression extension
+	actualName := name
+	if config.StripExtension {
+		for _, algo := range []Algorithm{config.Algorithm, AlgorithmGzip, AlgorithmZstd, AlgorithmLZ4, AlgorithmBrotli, AlgorithmSnappy} {
+			ext := GetExtension(algo)
+			if ext == "" {
+				continue
+			}
+			testName := name + ext
+			if _, err := cfs.base.Stat(testName); err == nil {
+				actualName = testName
+				break
+			}
+		}
+	}
+
+	return cfs.base.Truncate(actualName, size)
+}
+
+// Ensure FS implements absfs.FileSystem at compile time
+var _ absfs.FileSystem = (*FS)(nil)

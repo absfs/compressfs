@@ -4,15 +4,17 @@ import (
 	"io/fs"
 	"os"
 	"sync/atomic"
+
+	"github.com/absfs/absfs"
 )
 
 // Open opens a file for reading
-func (cfs *FS) Open(name string) (File, error) {
+func (cfs *FS) Open(name string) (absfs.File, error) {
 	return cfs.OpenFile(name, os.O_RDONLY, 0)
 }
 
 // OpenFile opens a file with specified flags and permissions
-func (cfs *FS) OpenFile(name string, flag int, perm fs.FileMode) (File, error) {
+func (cfs *FS) OpenFile(name string, flag int, perm fs.FileMode) (absfs.File, error) {
 	cfs.mu.RLock()
 	config := cfs.config
 	cfs.mu.RUnlock()
@@ -56,7 +58,7 @@ func (cfs *FS) OpenFile(name string, flag int, perm fs.FileMode) (File, error) {
 }
 
 // Create creates a new file for writing
-func (cfs *FS) Create(name string) (File, error) {
+func (cfs *FS) Create(name string) (absfs.File, error) {
 	return cfs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
@@ -124,9 +126,27 @@ func (cfs *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	config := cfs.config
 	cfs.mu.RUnlock()
 
-	entries, err := cfs.base.ReadDir(name)
+	// Open directory and read entries
+	f, err := cfs.base.Open(name)
 	if err != nil {
 		return nil, err
+	}
+	defer f.Close()
+
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert names to DirEntry
+	entries := make([]fs.DirEntry, 0, len(names))
+	for _, entryName := range names {
+		fullPath := name + string(cfs.Separator()) + entryName
+		info, err := cfs.base.Stat(fullPath)
+		if err != nil {
+			continue // Skip entries we can't stat
+		}
+		entries = append(entries, fs.FileInfoToDirEntry(info))
 	}
 
 	// If StripExtension is enabled, remove compression extensions from names

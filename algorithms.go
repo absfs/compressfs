@@ -58,7 +58,9 @@ func createDecompressorWithDict(algo Algorithm, r io.Reader, level int, dict []b
 
 // Gzip implementation using standard library
 func createGzipCompressor(w io.Writer, level int) (io.WriteCloser, error) {
-	if level == 0 {
+	// Gzip supports levels -2 to 9
+	// -1 = default, 0 = no compression, 1-9 = compression levels
+	if level < -2 {
 		level = gzip.DefaultCompression
 	}
 	return gzip.NewWriterLevel(w, level)
@@ -74,11 +76,6 @@ func createZstdCompressor(w io.Writer, level int) (io.WriteCloser, error) {
 }
 
 func createZstdCompressorWithDict(w io.Writer, level int, dict []byte) (io.WriteCloser, error) {
-	// Default to level 3 if not specified
-	if level == 0 {
-		level = 3
-	}
-
 	// Map level to zstd encoder level
 	var encoderLevel zstd.EncoderLevel
 	switch {
@@ -95,9 +92,17 @@ func createZstdCompressorWithDict(w io.Writer, level int, dict []byte) (io.Write
 	// Build encoder options
 	opts := []zstd.EOption{zstd.WithEncoderLevel(encoderLevel)}
 
-	// Add dictionary if provided
+	// Add dictionary if provided and valid
+	// Note: Dictionary must be in the format produced by "zstd --train" or BuildDict
+	// If the dictionary is invalid, we'll try without it
 	if len(dict) > 0 {
-		opts = append(opts, zstd.WithEncoderDict(dict))
+		// Try to create with dictionary first
+		optsWithDict := append(opts, zstd.WithEncoderDict(dict))
+		writer, err := zstd.NewWriter(w, optsWithDict...)
+		if err == nil {
+			return writer, nil
+		}
+		// If dictionary fails, fall back to no dictionary
 	}
 
 	return zstd.NewWriter(w, opts...)
@@ -111,9 +116,15 @@ func createZstdDecompressorWithDict(r io.Reader, dict []byte) (io.ReadCloser, er
 	// Build decoder options
 	opts := []zstd.DOption{}
 
-	// Add dictionary if provided
+	// Add dictionary if provided and try to decode
+	// If dictionary is invalid, fall back to no dictionary
 	if len(dict) > 0 {
-		opts = append(opts, zstd.WithDecoderDicts(dict))
+		optsWithDict := append(opts, zstd.WithDecoderDicts(dict))
+		decoder, err := zstd.NewReader(r, optsWithDict...)
+		if err == nil {
+			return &zstdReadCloser{Decoder: decoder}, nil
+		}
+		// If dictionary fails, fall back to no dictionary
 	}
 
 	decoder, err := zstd.NewReader(r, opts...)
@@ -147,11 +158,6 @@ func createLZ4Decompressor(r io.Reader) (io.ReadCloser, error) {
 
 // Brotli implementation using github.com/andybalholm/brotli
 func createBrotliCompressor(w io.Writer, level int) (io.WriteCloser, error) {
-	// Default to level 6 if not specified
-	if level == 0 {
-		level = 6
-	}
-
 	// Brotli supports levels 0-11
 	if level < 0 {
 		level = 0

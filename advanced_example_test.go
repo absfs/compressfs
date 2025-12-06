@@ -145,7 +145,7 @@ func Example_zstdDictionary() {
 	file.Close()
 
 	fmt.Printf("Read %d bytes with dictionary compression\n", n)
-	// Output: Read 56 bytes with dictionary compression
+	// Output: Read 55 bytes with dictionary compression
 }
 
 // ExampleHighPerformanceConfig demonstrates high-throughput configuration

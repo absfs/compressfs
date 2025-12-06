@@ -38,7 +38,7 @@ func TestNewWithPresets(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		create func(FileSystem) (*FS, error)
+		create func(interface{}) (*FS, error)
 	}{
 		{"Recommended", NewWithRecommendedConfig},
 		{"Fastest", NewWithFastestConfig},

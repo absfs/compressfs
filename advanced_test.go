@@ -234,7 +234,7 @@ func TestNewConstructors(t *testing.T) {
 
 	constructors := []struct {
 		name string
-		fn   func(FileSystem) (*FS, error)
+		fn   func(interface{}) (*FS, error)
 	}{
 		{"SmartConfig", NewWithSmartConfig},
 		{"HighPerformance", NewWithHighPerformance},
