@@ -2,6 +2,8 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/absfs/compressfs.svg)](https://pkg.go.dev/github.com/absfs/compressfs)
 [![Go Report Card](https://goreportcard.com/badge/github.com/absfs/compressfs)](https://goreportcard.com/report/github.com/absfs/compressfs)
+[![CI](https://github.com/absfs/compressfs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/compressfs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A transparent compression/decompression wrapper for the [absfs](https://github.com/absfs/absfs) filesystem abstraction layer.
 
