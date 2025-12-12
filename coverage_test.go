@@ -233,18 +233,6 @@ func TestFileSystemMethods(t *testing.T) {
 		t.Fatalf("Failed to create compressfs: %v", err)
 	}
 
-	// Test Separator
-	sep := cfs.Separator()
-	if sep != '/' && sep != '\\' {
-		t.Errorf("Invalid separator: %c", sep)
-	}
-
-	// Test ListSeparator
-	listSep := cfs.ListSeparator()
-	if listSep != ':' && listSep != ';' {
-		t.Errorf("Invalid list separator: %c", listSep)
-	}
-
 	// Test TempDir
 	tmpDir := cfs.TempDir()
 	if tmpDir == "" {

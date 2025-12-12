@@ -578,3 +578,20 @@ func (cf *compressedFile) Readdirnames(n int) (names []string, err error) {
 
 	return nil, os.ErrInvalid
 }
+
+// ReadDir reads the contents of the directory and returns a slice of DirEntry values.
+func (cf *compressedFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	if cf.closed {
+		return nil, fs.ErrClosed
+	}
+
+	// Delegate to base file if it supports ReadDir
+	if rd, ok := cf.base.(interface{ ReadDir(int) ([]fs.DirEntry, error) }); ok {
+		return rd.ReadDir(n)
+	}
+
+	return nil, os.ErrInvalid
+}

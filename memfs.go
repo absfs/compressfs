@@ -241,6 +241,26 @@ func (mfs *memFS) Chown(name string, uid, gid int) error {
 	return nil
 }
 
+// ReadFile reads the named file and returns its contents
+func (mfs *memFS) ReadFile(name string) ([]byte, error) {
+	mfs.mu.RLock()
+	defer mfs.mu.RUnlock()
+
+	name = normalizePath(name)
+	mf, exists := mfs.files[name]
+	if !exists {
+		return nil, &fs.PathError{Op: "readfile", Path: name, Err: fs.ErrNotExist}
+	}
+
+	return mf.data.Bytes(), nil
+}
+
+// Sub returns a fs.FS corresponding to the subtree rooted at dir
+func (mfs *memFS) Sub(dir string) (fs.FS, error) {
+	// For simplicity, memFS doesn't support Sub
+	return nil, os.ErrPermission
+}
+
 func (mf *memFile) Read(p []byte) (n int, err error) {
 	mf.mu.Lock()
 	defer mf.mu.Unlock()
@@ -448,6 +468,12 @@ func (mf *memFile) Readdirnames(n int) ([]string, error) {
 	return nil, os.ErrInvalid
 }
 
+// ReadDir reads the contents of the directory
+func (mf *memFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	// Not a directory
+	return nil, os.ErrInvalid
+}
+
 // ============================================================================
 // memDir - Virtual directory implementation for memFS
 // ============================================================================
@@ -554,4 +580,17 @@ func (md *memDir) Readdirnames(n int) ([]string, error) {
 	}
 
 	return names, nil
+}
+
+func (md *memDir) ReadDir(n int) ([]fs.DirEntry, error) {
+	infos, err := md.Readdir(n)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]fs.DirEntry, len(infos))
+	for i, info := range infos {
+		entries[i] = fs.FileInfoToDirEntry(info)
+	}
+	return entries, nil
 }

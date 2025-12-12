@@ -1,6 +1,8 @@
 package compressfs
 
 import (
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"sync/atomic"
@@ -126,27 +128,10 @@ func (cfs *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	config := cfs.config
 	cfs.mu.RUnlock()
 
-	// Open directory and read entries
-	f, err := cfs.base.Open(name)
+	// Delegate to base implementation if available
+	entries, err := cfs.base.ReadDir(name)
 	if err != nil {
 		return nil, err
-	}
-	defer f.Close()
-
-	names, err := f.Readdirnames(-1)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert names to DirEntry
-	entries := make([]fs.DirEntry, 0, len(names))
-	for _, entryName := range names {
-		fullPath := name + string(cfs.Separator()) + entryName
-		info, err := cfs.base.Stat(fullPath)
-		if err != nil {
-			continue // Skip entries we can't stat
-		}
-		entries = append(entries, fs.FileInfoToDirEntry(info))
 	}
 
 	// If StripExtension is enabled, remove compression extensions from names
@@ -155,8 +140,8 @@ func (cfs *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 		seen := make(map[string]bool)
 
 		for _, entry := range entries {
-			name := entry.Name()
-			stripped, _, hasCompExt := StripExtension(name)
+			entryName := entry.Name()
+			stripped, _, hasCompExt := StripExtension(entryName)
 
 			// If it has compression extension, use stripped name
 			if hasCompExt {
@@ -168,9 +153,9 @@ func (cfs *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 					seen[stripped] = true
 				}
 			} else {
-				if !seen[name] {
+				if !seen[entryName] {
 					result = append(result, entry)
-					seen[name] = true
+					seen[entryName] = true
 				}
 			}
 		}
@@ -178,6 +163,65 @@ func (cfs *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 
 	return entries, nil
+}
+
+// ReadFile reads the named file and returns its contents.
+// This reads and decompresses the file if it's compressed.
+func (cfs *FS) ReadFile(name string) ([]byte, error) {
+	f, err := cfs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Get size hint for efficient allocation
+	var size int64
+	if info, err := f.Stat(); err == nil {
+		size = info.Size()
+	}
+
+	// Pre-allocate buffer if we have size info
+	if size > 0 {
+		buf := make([]byte, size)
+		n, err := io.ReadFull(f, buf)
+		if err == io.ErrUnexpectedEOF {
+			// File was shorter than expected, return what we got
+			return buf[:n], nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+
+	// Unknown size, read all
+	return io.ReadAll(f)
+}
+
+// Sub returns a fs.FS corresponding to the subtree rooted at dir.
+func (cfs *FS) Sub(dir string) (fs.FS, error) {
+	// Verify the directory exists
+	info, err := cfs.Stat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, &os.PathError{Op: "sub", Path: dir, Err: errors.New("not a directory")}
+	}
+
+	// Get base sub filesystem
+	baseSub, err := cfs.base.Sub(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap it with compression
+	compressSubFS, err := New(baseSub, cfs.config)
+	if err != nil {
+		return nil, err
+	}
+
+	return absfs.FilerToFS(compressSubFS, dir)
 }
 
 // renamedDirEntry wraps a DirEntry with a different name

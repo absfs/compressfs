@@ -346,6 +346,25 @@ func (a *filerAdapter) Chown(name string, uid, gid int) error {
 	return os.ErrPermission
 }
 
+func (a *filerAdapter) ReadDir(name string) ([]fs.DirEntry, error) {
+	return a.base.ReadDir(name)
+}
+
+func (a *filerAdapter) ReadFile(name string) ([]byte, error) {
+	// Fallback implementation via Open and ReadAll
+	f, err := a.base.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func (a *filerAdapter) Sub(dir string) (fs.FS, error) {
+	// Not supported in old FileSystem interface
+	return nil, os.ErrPermission
+}
+
 // shouldSkip returns true if the file should not be compressed
 func (cfs *FS) shouldSkip(name string) bool {
 	if cfs.skip == nil {
@@ -609,16 +628,6 @@ func (cfs *FS) Chown(name string, uid, gid int) error {
 	}
 
 	return err
-}
-
-// Separator returns the path separator
-func (cfs *FS) Separator() uint8 {
-	return filepath.Separator
-}
-
-// ListSeparator returns the list separator
-func (cfs *FS) ListSeparator() uint8 {
-	return filepath.ListSeparator
 }
 
 // Chdir changes the current working directory
